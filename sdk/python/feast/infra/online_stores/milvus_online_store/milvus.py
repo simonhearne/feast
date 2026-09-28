@@ -230,6 +230,11 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     # Search params, e.g. {"ef": 64}, or {"level": 2} for AUTOINDEX.
     # Defaults to {"nprobe": 10}, or {} for AUTOINDEX.
     search_params: Optional[Dict[str, Any]] = None
+    # Applied when collections are created and on every read and search.
+    # When unset, Milvus uses its default (Bounded) and the collection's level.
+    consistency_level: Optional[
+        Literal["Strong", "Bounded", "Session", "Eventually"]
+    ] = None
     username: Optional[StrictStr] = ""
     password: Optional[StrictStr] = ""
     enable_openai_compatible_store: Optional[bool] = False
@@ -421,6 +426,7 @@ class MilvusOnlineStore(OnlineStore):
                     dimension=config.online_store.embedding_dim,
                     schema=schema,
                     index_params=index_params,
+                    **_consistency_kwargs(config.online_store),
                 )
             else:
                 self._ensure_loaded(collection_name)
@@ -584,6 +590,7 @@ class MilvusOnlineStore(OnlineStore):
             collection_name=collection_name,
             filter=query_filter_for_entities,
             output_fields=output_fields,
+            **_consistency_kwargs(config.online_store),
         )
         # Group hits by composite key.
         grouped_hits: Dict[str, Any] = {}
@@ -863,6 +870,7 @@ class MilvusOnlineStore(OnlineStore):
                 limit=top_k,
                 output_fields=output_fields,
                 filter=combined_filter,
+                **_consistency_kwargs(config.online_store),
             )
 
         elif embedding is not None and config.online_store.vector_enabled:
@@ -880,6 +888,7 @@ class MilvusOnlineStore(OnlineStore):
                 limit=top_k,
                 output_fields=output_fields,
                 filter=metadata_filter_expr,
+                **_consistency_kwargs(config.online_store),
             )
 
         elif query_string is not None:
@@ -915,6 +924,7 @@ class MilvusOnlineStore(OnlineStore):
                 filter=combined_filter or text_filter,
                 output_fields=output_fields,
                 limit=top_k,
+                **_consistency_kwargs(config.online_store),
             )
 
             results = [
@@ -1051,6 +1061,13 @@ def _search_params(online_config: MilvusOnlineStoreConfig) -> Dict[str, Any]:
     if _is_autoindex(online_config):
         return {}
     return {"nprobe": 10}
+
+
+def _consistency_kwargs(online_config: MilvusOnlineStoreConfig) -> Dict[str, Any]:
+    """Only pass consistency_level when configured, to keep Milvus defaults."""
+    if online_config.consistency_level:
+        return {"consistency_level": online_config.consistency_level}
+    return {}
 
 
 def _milvus_token(online_config: MilvusOnlineStoreConfig) -> str:

@@ -312,3 +312,37 @@ def test_autoindex_with_search_level(
         lambda hits: len(hits) == 1,
     )
     assert hits[0]["city"].string_val == "Paris"
+
+
+@pytest.mark.parametrize("consistency_level", [None, "Strong"])
+def test_consistency_level(
+    tmp_path: Path,
+    project: str,
+    store: MilvusOnlineStore,
+    consistency_level: Optional[str],
+) -> None:
+    online_store = {"consistency_level": consistency_level} if consistency_level else {}
+    config = _repo_config(tmp_path, project, **online_store)
+    fv = _scalar_feature_view()
+    store.update(config, [], [fv], [], [], partial=False)
+
+    assert store.client is not None
+    description = store.client.describe_collection(f"{project}_{fv.name}")
+    # Milvus defaults to Bounded when no level is configured.
+    assert description["consistency_level_name"] == (consistency_level or "Bounded")
+
+    if consistency_level == "Strong":
+        # With Strong consistency a write is visible to the next read.
+        _write_rows(
+            store,
+            config,
+            fv,
+            {
+                1: {
+                    "trips_today": ValueProto(float_val=1.0),
+                    "city": ValueProto(string_val="Oslo"),
+                }
+            },
+        )
+        rows = _read(store, config, fv, [1], ["city"])
+        assert rows[0] is not None and rows[0]["city"].string_val == "Oslo"

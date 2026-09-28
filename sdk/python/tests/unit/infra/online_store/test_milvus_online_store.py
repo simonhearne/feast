@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 from pymilvus import DataType, MilvusClient
 from pymilvus.client.types import LoadState
 
@@ -496,3 +497,61 @@ def test_autoindex_search_with_level(tmp_path: Path) -> None:
 
     assert len(results) == 1
     assert results[0][2] is not None and results[0][2]["city"].string_val == "Paris"
+
+
+def _consistency_calls(**online_store: Any) -> List[Dict[str, Any]]:
+    """Return the kwargs of create_collection, query and search calls."""
+    with patch(f"{MILVUS_MODULE}.MilvusClient") as mock_client_cls:
+        mock_client = _mock_client(mock_client_cls, has_collection=False)
+        mock_client.describe_collection.return_value = {
+            "collection_name": "test_milvus_driver_embeddings",
+            "fields": [
+                {"name": "driver_id_pk", "type": DataType.VARCHAR, "params": {}},
+                {"name": "event_ts", "type": DataType.INT64, "params": {}},
+                {"name": "created_ts", "type": DataType.INT64, "params": {}},
+                {
+                    "name": "embedding",
+                    "type": DataType.FLOAT_VECTOR,
+                    "params": {"dim": 2},
+                },
+                {"name": "city", "type": DataType.VARCHAR, "params": {}},
+            ],
+        }
+        mock_client.search.return_value = [[]]
+        mock_client.query.return_value = []
+
+        store = MilvusOnlineStore()
+        config = _mock_config(embedding_dim=2, **online_store)
+        fv = _vector_feature_view()
+        store.online_read(config, fv, [_entity_key(1)], ["city"])
+        store.retrieve_online_documents_v2(
+            config, fv, ["embedding", "city"], embedding=[1.0, 0.0], top_k=1
+        )
+        store.retrieve_online_documents_v2(
+            config, fv, ["city"], embedding=None, top_k=1, query_string="Paris"
+        )
+        return [
+            call.kwargs
+            for call in mock_client.create_collection.call_args_list
+            + mock_client.query.call_args_list
+            + mock_client.search.call_args_list
+        ]
+
+
+def test_consistency_level_not_sent_when_unset() -> None:
+    calls = _consistency_calls()
+
+    assert len(calls) == 4
+    assert all("consistency_level" not in kwargs for kwargs in calls)
+
+
+def test_consistency_level_applied_to_create_read_and_search() -> None:
+    calls = _consistency_calls(consistency_level="Strong")
+
+    assert len(calls) == 4
+    assert all(kwargs["consistency_level"] == "Strong" for kwargs in calls)
+
+
+def test_invalid_consistency_level_rejected() -> None:
+    with pytest.raises(ValidationError):
+        MilvusOnlineStoreConfig(consistency_level="Immediate")
