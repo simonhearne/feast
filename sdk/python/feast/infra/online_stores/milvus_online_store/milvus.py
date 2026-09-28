@@ -3,14 +3,30 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from pydantic import StrictStr, field_validator
 from pymilvus import (
+    AnnSearchRequest,
     CollectionSchema,
     DataType,
     FieldSchema,
+    Function,
+    FunctionType,
     MilvusClient,
+    RRFRanker,
+    WeightedRanker,
 )
 from pymilvus.client.types import LoadState
 
@@ -238,6 +254,16 @@ class MilvusOnlineStoreConfig(FeastConfigBaseModel, VectorStoreConfig):
     # Field to use as the Milvus partition key in feature views that contain it.
     # A feature view's "milvus.partition_key" tag takes precedence.
     partition_key: Optional[StrictStr] = None
+    # Use Milvus BM25 full-text search for query_string instead of LIKE filters.
+    # Only applies to collections created while it is enabled.
+    full_text_search: Optional[bool] = False
+    # Analyzer for full-text fields, e.g. {"type": "english"} or
+    # {"tokenizer": "icu"}. Defaults to {"type": "standard"}.
+    text_analyzer_params: Optional[Dict[str, Any]] = None
+    # How to combine vector and full-text results: "rrf" or "weighted".
+    hybrid_ranker: Optional[Literal["rrf", "weighted"]] = "rrf"
+    # Ranker params, e.g. {"k": 60} for rrf or {"weights": [0.7, 0.3]} for weighted.
+    hybrid_ranker_params: Optional[Dict[str, Any]] = None
     username: Optional[StrictStr] = ""
     password: Optional[StrictStr] = ""
     enable_openai_compatible_store: Optional[bool] = False
@@ -267,6 +293,8 @@ class MilvusOnlineStore(OnlineStore):
         super().__init__()
         self.client: Optional[MilvusClient] = None
         self._collections: Dict[str, Any] = {}
+        # Collections already warned about lacking full-text search.
+        self._full_text_fallback_warned: Set[str] = set()
 
     def _get_db_path(self, config: RepoConfig) -> str:
         assert (
@@ -376,8 +404,18 @@ class MilvusOnlineStore(OnlineStore):
                                 max_length=field_max_length,
                             )
                         )
+            functions: List[Function] = []
+            if config.online_store.full_text_search:
+                functions = _add_full_text_fields(
+                    fields, _full_text_field_names(table), config.online_store
+                )
             has_vector_field = any(
-                f.dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR)
+                f.dtype
+                in (
+                    DataType.FLOAT_VECTOR,
+                    DataType.BINARY_VECTOR,
+                    DataType.SPARSE_FLOAT_VECTOR,
+                )
                 for f in fields
             )
             if not has_vector_field:
@@ -392,7 +430,9 @@ class MilvusOnlineStore(OnlineStore):
             if partition_key:
                 _mark_partition_key(fields, partition_key, table.name)
             schema = CollectionSchema(
-                fields=fields, description="Feast feature view data"
+                fields=fields,
+                description="Feast feature view data",
+                functions=functions or None,
             )
             collection_exists = self.client.has_collection(
                 collection_name=collection_name
@@ -400,6 +440,14 @@ class MilvusOnlineStore(OnlineStore):
             if not collection_exists:
                 index_params = self.client.prepare_index_params()
                 for vector_field in schema.fields:
+                    if vector_field.dtype == DataType.SPARSE_FLOAT_VECTOR:
+                        index_params.add_index(
+                            field_name=vector_field.name,
+                            metric_type="BM25",
+                            index_type="SPARSE_INVERTED_INDEX",
+                            index_name=f"bm25_index_{vector_field.name}",
+                        )
+                        continue
                     if vector_field.dtype not in [
                         DataType.FLOAT_VECTOR,
                         DataType.BINARY_VECTOR,
@@ -477,7 +525,12 @@ class MilvusOnlineStore(OnlineStore):
         vector_cols = [f.name for f in table.features if f.vector_index]
         entity_batch_to_insert = []
         unique_entities: dict[str, dict[str, Any]] = {}
-        required_fields = {field["name"] for field in collection["fields"]}
+        # Milvus computes function outputs, such as BM25 sparse vectors, itself.
+        required_fields = {
+            field["name"]
+            for field in collection["fields"]
+            if not field.get("is_function_output")
+        }
         collection_field_types = {
             field["name"]: field["type"] for field in collection["fields"]
         }
@@ -845,7 +898,81 @@ class MilvusOnlineStore(OnlineStore):
                 return active[0]
             return " and ".join(f"({p})" for p in active)
 
+        bm25_fields = _bm25_output_fields(collection)
+        use_full_text_search = (
+            query_string is not None
+            and bool(config.online_store.full_text_search)
+            and bool(bm25_fields)
+        )
         if (
+            query_string is not None
+            and config.online_store.full_text_search
+            and not bm25_fields
+            and collection_name not in self._full_text_fallback_warned
+        ):
+            self._full_text_fallback_warned.add(collection_name)
+            logger.warning(
+                "full_text_search is enabled, but collection '%s' was created "
+                "without it, so keyword search falls back to LIKE filters. Run "
+                "`feast teardown` and `feast apply`, then materialize again to "
+                "use full-text search.",
+                collection_name,
+            )
+
+        if use_full_text_search:
+            assert query_string is not None
+            if embedding is None and len(bm25_fields) == 1:
+                results = self.client.search(
+                    collection_name=collection_name,
+                    data=[query_string],
+                    anns_field=bm25_fields[0],
+                    search_params={"metric_type": "BM25", "params": {}},
+                    limit=top_k,
+                    output_fields=output_fields,
+                    filter=metadata_filter_expr,
+                    **_consistency_kwargs(config.online_store),
+                )
+            else:
+                requests = []
+                if embedding is not None:
+                    if ann_search_field is None:
+                        raise ValueError(
+                            "Hybrid search needs a vector field among the "
+                            "requested features"
+                        )
+                    requests.append(
+                        AnnSearchRequest(
+                            data=[embedding],
+                            anns_field=ann_search_field,
+                            param={
+                                "metric_type": distance_metric
+                                or config.online_store.metric_type,
+                                "params": _search_params(config.online_store),
+                            },
+                            limit=top_k,
+                            expr=metadata_filter_expr,
+                        )
+                    )
+                for bm25_field in bm25_fields:
+                    requests.append(
+                        AnnSearchRequest(
+                            data=[query_string],
+                            anns_field=bm25_field,
+                            param={"metric_type": "BM25", "params": {}},
+                            limit=top_k,
+                            expr=metadata_filter_expr,
+                        )
+                    )
+                results = self.client.hybrid_search(
+                    collection_name=collection_name,
+                    reqs=requests,
+                    ranker=_hybrid_ranker(config.online_store, len(requests)),
+                    limit=top_k,
+                    output_fields=output_fields,
+                    **_consistency_kwargs(config.online_store),
+                )
+
+        elif (
             embedding is not None
             and query_string is not None
             and config.online_store.vector_enabled
@@ -1082,6 +1209,94 @@ def _search_params(online_config: MilvusOnlineStoreConfig) -> Dict[str, Any]:
     if _is_autoindex(online_config):
         return {}
     return {"nprobe": 10}
+
+
+FULL_TEXT_SEARCH_TAG = "milvus.full_text_search"
+BM25_FIELD_SUFFIX = "__bm25"
+DEFAULT_TEXT_ANALYZER_PARAMS: Dict[str, Any] = {"type": "standard"}
+
+
+def _full_text_field_names(table: FeatureView) -> List[str]:
+    """String features to index for full-text search.
+
+    If any feature is tagged ``milvus.full_text_search: "true"``, only those
+    features are indexed; otherwise every String feature is.
+    """
+    string_features = [
+        f
+        for f in table.features
+        if isinstance(f.dtype, PrimitiveFeastType)
+        and f.dtype.to_value_type() == ValueType.STRING
+    ]
+    tagged = [
+        f.name
+        for f in string_features
+        if f.tags.get(FULL_TEXT_SEARCH_TAG, "").lower() == "true"
+    ]
+    return tagged or [f.name for f in string_features]
+
+
+def _add_full_text_fields(
+    fields: List[FieldSchema],
+    text_field_names: List[str],
+    online_config: MilvusOnlineStoreConfig,
+) -> List[Function]:
+    """Enable an analyzer on each text field and add a BM25 sparse output field.
+
+    Returns the BM25 functions to add to the collection schema.
+    """
+    analyzer_params = online_config.text_analyzer_params or DEFAULT_TEXT_ANALYZER_PARAMS
+    functions = []
+    for i, field in enumerate(fields):
+        if field.name not in text_field_names or field.dtype != DataType.VARCHAR:
+            continue
+        fields[i] = FieldSchema(
+            name=field.name,
+            dtype=DataType.VARCHAR,
+            max_length=field.params["max_length"],
+            enable_analyzer=True,
+            analyzer_params=analyzer_params,
+        )
+        output_name = f"{field.name}{BM25_FIELD_SUFFIX}"
+        fields.append(FieldSchema(name=output_name, dtype=DataType.SPARSE_FLOAT_VECTOR))
+        functions.append(
+            Function(
+                name=f"{field.name}_bm25",
+                function_type=FunctionType.BM25,
+                input_field_names=[field.name],
+                output_field_names=[output_name],
+            )
+        )
+    return functions
+
+
+def _bm25_output_fields(collection: Dict[str, Any]) -> List[str]:
+    """Sparse fields produced by BM25 functions in an existing collection."""
+    return [
+        output
+        for function in collection.get("functions") or []
+        if FunctionType(function["type"]) == FunctionType.BM25
+        for output in function["output_field_names"]
+    ]
+
+
+def _hybrid_ranker(
+    online_config: MilvusOnlineStoreConfig, num_requests: int
+) -> Union[RRFRanker, WeightedRanker]:
+    params = dict(online_config.hybrid_ranker_params or {})
+    if online_config.hybrid_ranker == "weighted":
+        weights = params.get("weights") or [1.0 / num_requests] * num_requests
+        if len(weights) != num_requests:
+            raise ValueError(
+                f"hybrid_ranker_params.weights has {len(weights)} weights, but the "
+                f"search combines {num_requests} requests: the vector search (if "
+                "an embedding is given) followed by one per full-text field."
+            )
+        # norm_score is only accepted by newer pymilvus versions.
+        if "norm_score" in params:
+            return WeightedRanker(*weights, norm_score=params["norm_score"])
+        return WeightedRanker(*weights)
+    return RRFRanker(k=params.get("k", 60))
 
 
 PARTITION_KEY_TAG = "milvus.partition_key"

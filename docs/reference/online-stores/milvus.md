@@ -96,6 +96,10 @@ online_store:
 | `search_params` | unset | Search parameters passed to Milvus, e.g. `{ef: 64}` for HNSW or `{level: 2}` for `AUTOINDEX`. Defaults to `{nprobe: 10}`, or no parameters for `AUTOINDEX`. |
 | `consistency_level` | unset | `Strong`, `Bounded`, `Session` or `Eventually`. Applied when collections are created and on every read and search. When unset, Milvus uses its default (`Bounded`). |
 | `partition_key` | unset | Field to use as the Milvus partition key in feature views that contain it. See [Partition key](#partition-key). |
+| `full_text_search` | `false` | Use Milvus BM25 full-text search for `query_string`. See [Full-text search](#full-text-search). |
+| `text_analyzer_params` | `{type: standard}` | Analyzer for full-text fields, e.g. `{type: english}` or `{tokenizer: icu}`. |
+| `hybrid_ranker` | `rrf` | How to combine vector and full-text results: `rrf` or `weighted`. |
+| `hybrid_ranker_params` | unset | Ranker parameters, e.g. `{k: 60}` for `rrf` or `{weights: [0.7, 0.3]}` for `weighted`. |
 | `vector_enabled` | `true` | Enables vector search. |
 | `varchar_max_length` | `65535` | Default `max_length` of VARCHAR fields. Override per field with the `max_length` tag. |
 | `native_numeric_types` | `false` | Store numeric and bool features as native Milvus types. See [Numeric types](#numeric-types). |
@@ -132,6 +136,56 @@ online_store:
 
 Index parameters only apply when Feast creates a collection. To change them for an existing
 collection, run `feast teardown` and `feast apply`, then materialize again.
+
+## Full-text search
+
+By default, `query_string` searches use `LIKE '%query%'` filters on String features, which match
+substrings and don't rank results. With `full_text_search: true`, Feast uses Milvus
+[full-text search](https://milvus.io/docs/full-text-search.md) instead: each String feature gets an
+analyzer and a BM25 function that writes to a sparse `<feature>__bm25` field, and `query_string`
+searches rank documents by BM25 score.
+
+```yaml
+online_store:
+  type: milvus
+  full_text_search: true
+  text_analyzer_params:
+    type: english         # or {tokenizer: icu} for multilingual text
+```
+
+The default `standard` analyzer suits most languages that separate words with spaces. Use a
+language-specific analyzer such as `{type: english}` for stemming and stop words, or
+`{tokenizer: icu}` for multilingual text. See [Milvus analyzers](https://milvus.io/docs/analyzer-overview.md).
+Milvus Lite only supports the `standard` and `jieba` tokenizers.
+
+To index only some String features, tag them:
+
+```python
+Field(name="title", dtype=String, tags={"milvus.full_text_search": "true"})
+```
+
+When a search has both an embedding and a `query_string`, Feast runs a hybrid search: a vector
+search plus one BM25 search per full-text field, combined by the `hybrid_ranker`. With the
+`weighted` ranker, `weights` lists the vector search first, then each full-text field.
+
+```python
+store.retrieve_online_documents_v2(
+    features=["documents:embedding", "documents:body"],
+    query=query_embedding,
+    query_string="late delivery",
+    top_k=10,
+    distance_metric="COSINE",  # must match the vector index metric
+)
+```
+
+Full-text search requires pymilvus 2.5 or later and a Milvus version with BM25 support
+(Milvus 2.5+, Zilliz Cloud, or Milvus Lite).
+
+{% hint style="warning" %}
+Full-text search only applies to collections created while `full_text_search` is enabled. For
+existing collections Feast logs a warning and keeps using `LIKE` filters. To switch, run
+`feast teardown` and `feast apply`, then materialize again.
+{% endhint %}
 
 ## Partition key
 

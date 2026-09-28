@@ -393,3 +393,121 @@ def test_partition_key_filtering(
         filters=ComparisonFilter(type="eq", key="brand_id", value="globex"),
     )
     assert [hit["city"].string_val for hit in hits] == ["Rome"]
+
+
+def _full_text_feature_view() -> FeatureView:
+    return FeatureView(
+        name="documents",
+        entities=[
+            Entity(
+                name="driver_id", join_keys=["driver_id"], value_type=ValueType.INT64
+            )
+        ],
+        ttl=timedelta(days=1),
+        schema=[
+            Field(name="driver_id", dtype=Int64),
+            Field(
+                name="embedding",
+                dtype=Array(Float32),
+                vector_index=True,
+                vector_search_metric="COSINE",
+            ),
+            Field(name="body", dtype=String),
+        ],
+    )
+
+
+def _write_documents(
+    store: MilvusOnlineStore,
+    config: RepoConfig,
+    fv: FeatureView,
+    bodies: Dict[int, str],
+) -> None:
+    """Write documents 1 and 2 with the embeddings from _vector_rows."""
+    rows = {
+        driver_id: {
+            "embedding": values["embedding"],
+            "body": ValueProto(string_val=bodies[driver_id]),
+        }
+        for driver_id, values in _vector_rows().items()
+    }
+    _write_rows(store, config, fv, rows)
+
+
+def _full_text_search(
+    store: MilvusOnlineStore,
+    config: RepoConfig,
+    fv: FeatureView,
+    query: str,
+    embedding: Optional[List[float]] = None,
+) -> List[str]:
+    results = store.retrieve_online_documents_v2(
+        config,
+        fv,
+        ["embedding", "body"] if embedding else ["body"],
+        embedding=embedding,
+        top_k=5,
+        distance_metric="COSINE",
+        query_string=query,
+    )
+    return [values["body"].string_val for _, _, values in results if values]
+
+
+@pytest.mark.parametrize(
+    "analyzer, bodies, query, expected",
+    [
+        (
+            {"type": "english"},
+            {1: "The drivers were running late", 2: "A quiet evening"},
+            # The English analyzer stems "run" and "running" to the same term.
+            "run",
+            ["The drivers were running late"],
+        ),
+        (
+            {"tokenizer": "icu"},
+            {1: "東京の天気は晴れです", 2: "Das Wetter in Berlin ist schön"},
+            "天気",
+            ["東京の天気は晴れです"],
+        ),
+    ],
+    ids=["english", "icu"],
+)
+def test_full_text_search_analyzers(
+    tmp_path: Path,
+    project: str,
+    store: MilvusOnlineStore,
+    analyzer: Dict[str, Any],
+    bodies: Dict[int, str],
+    query: str,
+    expected: List[str],
+) -> None:
+    config = _repo_config(
+        tmp_path,
+        project,
+        consistency_level="Strong",
+        full_text_search=True,
+        text_analyzer_params=analyzer,
+    )
+    fv = _full_text_feature_view()
+    store.update(config, [], [fv], [], [], partial=False)
+    _write_documents(store, config, fv, bodies)
+
+    assert _full_text_search(store, config, fv, query) == expected
+
+
+def test_hybrid_vector_and_full_text_search(
+    tmp_path: Path, project: str, store: MilvusOnlineStore
+) -> None:
+    config = _repo_config(
+        tmp_path, project, consistency_level="Strong", full_text_search=True
+    )
+    fv = _full_text_feature_view()
+    store.update(config, [], [fv], [], [], partial=False)
+    _write_documents(
+        store, config, fv, {1: "late night delivery", 2: "early morning pickup"}
+    )
+
+    # The embedding matches document 2, the text matches document 1.
+    bodies = _full_text_search(store, config, fv, "delivery", embedding=[0.0, 1.0])
+
+    assert set(bodies) == {"late night delivery", "early morning pickup"}

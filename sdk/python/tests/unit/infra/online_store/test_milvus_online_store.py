@@ -789,3 +789,254 @@ def test_native_numeric_range_filter_and_round_trip(tmp_path: Path) -> None:
 
     rows = store.online_read(config, fv, [_product_key(1)], ["price", "title"])
     assert rows[0][1] is not None and rows[0][1]["price"].float_val == 9.0
+
+
+def _write_catalog_titles(
+    store: MilvusOnlineStore, config: RepoConfig, fv: FeatureView
+) -> None:
+    def embedding(x: float, y: float) -> ValueProto:
+        value = ValueProto()
+        value.float_list_val.val.extend([x, y])
+        return value
+
+    now = datetime.now(timezone.utc)
+    products = [
+        (1, (1.0, 0.0), "stainless steel electric kettle"),
+        (2, (0.0, 1.0), "cast iron frying pan"),
+        (3, (0.7, 0.7), "glass teapot with infuser"),
+    ]
+    store.online_write_batch(
+        config,
+        fv,
+        [
+            (
+                _product_key(product_id),
+                {
+                    "brand_id": ValueProto(string_val="acme"),
+                    "embedding": embedding(*vector),
+                    "title": ValueProto(string_val=title),
+                },
+                now,
+                now,
+            )
+            for product_id, vector, title in products
+        ],
+        progress=None,
+    )
+
+
+def _titles(results: List[Any]) -> List[str]:
+    return [values["title"].string_val for _, _, values in results if values]
+
+
+def _full_text_catalog(tags: Optional[Dict[str, str]] = None) -> FeatureView:
+    """A catalog feature view where only the title is full-text indexed."""
+    fv = _catalog_feature_view(tags)
+    for field in fv.schema:
+        if field.name == "title":
+            field.tags["milvus.full_text_search"] = "true"
+    return fv
+
+
+def test_full_text_search_schema(tmp_path: Path) -> None:
+    config = _lite_config(tmp_path, full_text_search=True)
+    fv = _full_text_catalog()
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+
+    assert store.client is not None
+    description = store.client.describe_collection("test_milvus_products")
+    fields = {f["name"]: f for f in description["fields"]}
+    assert fields["title__bm25"]["type"] == DataType.SPARSE_FLOAT_VECTOR
+    # Only the tagged field is indexed for full-text search.
+    assert "brand_id__bm25" not in fields
+    assert [f["output_field_names"] for f in description["functions"]] == [
+        ["title__bm25"]
+    ]
+
+
+def test_full_text_search(tmp_path: Path) -> None:
+    config = _lite_config(tmp_path, full_text_search=True)
+    fv = _full_text_catalog()
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+    _write_catalog_titles(store, config, fv)
+
+    # Rows with a missing or empty text feature are still written and read.
+    embedding = ValueProto()
+    embedding.float_list_val.val.extend([1.0, 0.0])
+    now = datetime.now(timezone.utc)
+    store.online_write_batch(
+        config,
+        fv,
+        [
+            (_product_key(4), {"embedding": embedding}, now, now),
+            (
+                _product_key(5),
+                {"embedding": embedding, "title": ValueProto(string_val="")},
+                now,
+                now,
+            ),
+        ],
+        progress=None,
+    )
+
+    results = store.retrieve_online_documents_v2(
+        config, fv, ["title"], embedding=None, top_k=2, query_string="kettle"
+    )
+
+    assert _titles(results) == ["stainless steel electric kettle"]
+    empty_rows = store.online_read(
+        config, fv, [_product_key(4), _product_key(5)], ["title"]
+    )
+    assert [values["title"].string_val for _, values in empty_rows if values] == [
+        "",
+        "",
+    ]
+    # online_read still works with function output fields in the collection.
+    rows = store.online_read(config, fv, [_product_key(2)], ["title"])
+    assert rows[0][1] is not None
+    assert rows[0][1]["title"].string_val == "cast iron frying pan"
+
+
+def test_full_text_search_matches_words_not_substrings(tmp_path: Path) -> None:
+    fv = _full_text_catalog()
+    like_config = _lite_config(tmp_path / "like")
+    bm25_config = _lite_config(tmp_path / "bm25", full_text_search=True)
+    results = {}
+    for name, config in [("like", like_config), ("bm25", bm25_config)]:
+        (tmp_path / name).mkdir()
+        store = MilvusOnlineStore()
+        store.update(config, [], [fv], [], [], partial=False)
+        _write_catalog_titles(store, config, fv)
+        results[name] = _titles(
+            store.retrieve_online_documents_v2(
+                config, fv, ["title"], embedding=None, top_k=5, query_string="pot"
+            )
+        )
+
+    # LIKE '%pot%' matches "teapot"; BM25 matches whole terms only.
+    assert results["like"] == ["glass teapot with infuser"]
+    assert results["bm25"] == []
+
+
+@pytest.mark.parametrize(
+    "ranker",
+    [
+        {},
+        {"hybrid_ranker": "weighted", "hybrid_ranker_params": {"weights": [0.2, 0.8]}},
+        {
+            "hybrid_ranker": "weighted",
+            "hybrid_ranker_params": {"weights": [0.5, 0.5], "norm_score": False},
+        },
+    ],
+    ids=["rrf", "weighted", "weighted_no_norm"],
+)
+def test_hybrid_vector_and_full_text_search(
+    tmp_path: Path, ranker: Dict[str, Any]
+) -> None:
+    config = _lite_config(tmp_path, full_text_search=True, **ranker)
+    fv = _full_text_catalog()
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+    _write_catalog_titles(store, config, fv)
+
+    # The embedding is closest to the frying pan, the text matches the kettle.
+    results = store.retrieve_online_documents_v2(
+        config,
+        fv,
+        ["embedding", "title"],
+        embedding=[0.0, 1.0],
+        top_k=3,
+        distance_metric="COSINE",
+        query_string="kettle",
+    )
+
+    titles = _titles(results)
+    assert "stainless steel electric kettle" in titles
+    assert "cast iron frying pan" in titles
+
+
+def test_weighted_ranker_needs_one_weight_per_request(tmp_path: Path) -> None:
+    config = _lite_config(
+        tmp_path,
+        full_text_search=True,
+        hybrid_ranker="weighted",
+        hybrid_ranker_params={"weights": [1.0]},
+    )
+    fv = _full_text_catalog()
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+
+    with pytest.raises(ValueError, match="1 weights"):
+        store.retrieve_online_documents_v2(
+            config,
+            fv,
+            ["embedding", "title"],
+            embedding=[0.0, 1.0],
+            top_k=3,
+            distance_metric="COSINE",
+            query_string="kettle",
+        )
+
+
+def test_full_text_search_falls_back_to_like_for_old_collections(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fv = _full_text_catalog()
+    store = MilvusOnlineStore()
+    # Created before full_text_search was enabled.
+    store.update(_lite_config(tmp_path), [], [fv], [], [], partial=False)
+    _write_catalog_titles(store, _lite_config(tmp_path), fv)
+
+    results = store.retrieve_online_documents_v2(
+        _lite_config(tmp_path, full_text_search=True),
+        fv,
+        ["title"],
+        embedding=None,
+        top_k=5,
+        query_string="pot",
+    )
+
+    assert _titles(results) == ["glass teapot with infuser"]
+    assert "falls back to LIKE" in caplog.text
+
+    # The warning is logged once per collection, not on every query.
+    caplog.clear()
+    store.retrieve_online_documents_v2(
+        _lite_config(tmp_path, full_text_search=True),
+        fv,
+        ["title"],
+        embedding=None,
+        top_k=5,
+        query_string="pot",
+    )
+    assert "falls back to LIKE" not in caplog.text
+
+
+def test_text_only_feature_view_needs_no_placeholder(tmp_path: Path) -> None:
+    config = _lite_config(tmp_path, full_text_search=True)
+    fv = FeatureView(
+        name="reviews",
+        entities=[_driver_entity()],
+        ttl=timedelta(days=1),
+        schema=[
+            Field(name="driver_id", dtype=Int64),
+            Field(name="review", dtype=String),
+        ],
+    )
+    store = MilvusOnlineStore()
+    store.update(config, [], [fv], [], [], partial=False)
+    _write_rows(
+        store, config, fv, {1: {"review": ValueProto(string_val="very punctual")}}
+    )
+
+    assert store.client is not None
+    fields = store.client.describe_collection("test_milvus_reviews")["fields"]
+    assert PLACEHOLDER_VECTOR_FIELD not in {f["name"] for f in fields}
+    results = store.retrieve_online_documents_v2(
+        config, fv, ["review"], embedding=None, top_k=1, query_string="punctual"
+    )
+    assert [values["review"].string_val for _, _, values in results if values] == [
+        "very punctual"
+    ]
